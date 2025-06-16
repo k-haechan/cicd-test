@@ -1,0 +1,291 @@
+name: 버전 태깅 자동화
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed] # PR이 머지될 때만 작동
+
+jobs:
+  bump-version-and-release:
+    if: github.event.pull_request.merged == true
+    name: 버전 업데이트 및 릴리스 생성
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.split_and_bump.outputs.new_tag }}
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 최신 버전 태그 가져오기
+        id: get_latest
+        run: |
+          git fetch --tags
+          TAG=$(git tag --sort=-v:refname | head -n 1)
+          echo "LATEST_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: 버전 업데이트 처리
+        id: split_and_bump
+        run: |
+          VERSION=${{ env.LATEST_TAG }}
+          VERSION="${VERSION#v}" # 'v' 제거
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+
+          LABELS_JSON='${{ toJson(github.event.pull_request.labels) }}'
+          LABEL_NAMES=$(echo "$LABELS_JSON" | jq -r '.[].name')
+
+          VERSION_TYPE=""
+          for label in $LABEL_NAMES; do
+            if [[ "$label" == "major" ]]; then
+              VERSION_TYPE="major"
+            elif [[ "$label" == "minor" ]]; then
+              VERSION_TYPE="minor"
+            elif [[ "$label" == "patch" ]]; then
+              VERSION_TYPE="patch"
+            fi
+          done
+
+          if [[ -z "$VERSION_TYPE" ]]; then
+            echo "❌ 유효한 버전 라벨이 없습니다."
+            exit 1
+          fi
+
+          case $VERSION_TYPE in
+            major)
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              ;;
+            minor)
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              ;;
+            patch)
+              PATCH=$((PATCH + 1))
+              ;;
+          esac
+
+          NEW_TAG="v$MAJOR.$MINOR.$PATCH"
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+
+      - name: Git 태그 생성 및 푸시
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git tag ${{ env.NEW_TAG }}
+          git push origin ${{ env.NEW_TAG }}
+
+      - name: GitHub 릴리스 생성
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          tag_name: ${{ env.NEW_TAG }}
+          name: 릴리스 ${{ env.NEW_TAG }}
+          body: |
+            🔖 PR 번호: #${{ github.event.pull_request.number }}
+            🔧 작성자: @${{ github.event.pull_request.user.login }}
+            📝 변경사항: ${{ github.event.pull_request.title }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-image-and-push:
+    name: 도커 이미지 빌드와 푸시
+    needs: bump-version-and-release
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_IMAGE_NAME: ${{ vars.DOCKER_IMAGE_NAME }}
+    outputs:
+      DOCKER_IMAGE_NAME: ${{ env.DOCKER_IMAGE_NAME }}
+      OWNER_LC: ${{ env.OWNER_LC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: .env 파일 생성
+        env:
+          ENV_FILE_CONTENT: ${{ secrets.ENV_FILE }}
+        run: echo "$ENV_FILE_CONTENT" > .env
+
+      - name: Docker Buildx 설치
+        uses: docker/setup-buildx-action@v3
+
+      - name: 레지스트리 로그인
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: set lower case owner name
+        run: echo "OWNER_LC=${OWNER,,}" >> $GITHUB_ENV
+        env:
+          OWNER: "${{ github.repository_owner }}"
+
+      - name: 빌드 앤 푸시
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          cache-from: type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/${{ env.DOCKER_IMAGE_NAME }}:cache
+          cache-to: type=registry,ref=ghcr.io/${{ env.OWNER_LC }}/${{ env.DOCKER_IMAGE_NAME }}:cache,mode=max
+          tags: |
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.DOCKER_IMAGE_NAME }}:${{ needs.bump-version-and-release.outputs.tag_name }}
+            ghcr.io/${{ env.OWNER_LC }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+
+  deploy:
+    name: 배포
+    runs-on: ubuntu-latest
+    needs: build-image-and-push # 이미지를 빌드하고 ECR에 푸시하는 job이 먼저 실행되어야 합니다.
+    permissions:
+      id-token: write # OIDC 인증을 위해 필요
+      contents: read # 코드 체크아웃을 위해 필요
+
+    env:
+      AWS_REGION: ap-northeast-2 # 당신의 AWS 리전으로 변경하세요
+      DOCKER_IMAGE_NAME: ${{ needs.build-image-and-push.outputs.DOCKER_IMAGE_NAME }}
+      OWNER_LC: ${{ needs.build-image-and-push.outputs.OWNER_LC }}
+      # 공통 배포 변수 (스크립트 내부에 사용될 변수들)
+      HEALTH_ENDPOINT: "/actuator/health"
+      TIMEOUT: 60
+      DOCKER_NETWORK_NAME: "common" # Docker 네트워크 이름
+
+    steps:
+      - name: AWS 로그인 (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # GitHub Actions OIDC를 사용하여 IAM 역할(dev-github-actions-role)을 Assume 합니다.
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 여러 인스턴스 ID 가져오기
+        id: get_instance_ids
+        run: |
+          # 'Role' 태그가 'app-server'이고 'running' 상태인 모든 인스턴스 ID를 가져옵니다.
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Role,Values=app-server" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+          
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "::error::No running instances with tag Role=app-server found. Deployment aborted."
+            exit 1
+          fi
+          
+          echo "찾은 인스턴스 ID들: $INSTANCE_IDS"
+          # 다음 스텝에서 INSTANCE_IDS 변수를 사용할 수 있도록 환경 변수에 저장
+          echo "INSTANCE_IDS=$INSTANCE_IDS" >> $GITHUB_ENV
+
+      - name: 여러 인스턴스에 배포 명령 실행
+        run: |
+          # 배포할 Docker 이미지 전체 경로
+          IMAGE_FULL_PATH="ghcr.io/${{ env.OWNER_LC }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+          
+          # 쉘 스크립트 명령어 정의 (블루/그린 배포 로직 포함)
+          # 여기에 포함되는 명령들은 EC2 인스턴스 내부에서 실행됩니다.
+          DEPLOY_SCRIPT=$(cat << 'EOF'
+            #!/bin/bash
+          
+            # 환경 변수 가져오기 (GitHub Actions에서 SSM으로 전달)
+            IMAGE="$1"
+            HEALTH_ENDPOINT="$2"
+            TIMEOUT="$3"
+            DOCKER_NETWORK_NAME="$4"
+          
+            # Docker 데몬이 실행 중인지 확인 및 시작
+            sudo systemctl start docker || true
+            sudo systemctl enable docker || true
+          
+            # Docker 네트워크 확인 (없으면 생성)
+            docker network create "$DOCKER_NETWORK_NAME" || true
+          
+            echo "--- 배포 시작: $IMAGE ---"
+          
+            # 현재 실행 중인 컨테이너 확인 및 다음 컨테이너 결정 (블루/그린 로직)
+            # app1_1이 실행 중이면 app1_2가 다음 타겟, 아니면 app1_1이 다음 타겟
+            if docker ps --format '{{.Names}}' | grep -q "app1_1"; then
+              CURRENT_CONTAINER_NAME="app1_1"
+              NEXT_CONTAINER_NAME="app1_2"
+              CURRENT_HOST_PORT=8080 # 현재 컨테이너가 호스트에 매핑된 포트
+              NEXT_HOST_PORT=8081    # 다음 컨테이너가 호스트에 매핑될 포트
+            else
+              CURRENT_CONTAINER_NAME="app1_2"
+              NEXT_CONTAINER_NAME="app1_1"
+              CURRENT_HOST_PORT=8081 # 현재 컨테이너가 호스트에 매핑된 포트
+              NEXT_HOST_PORT=8080    # 다음 컨테이너가 호스트에 매핑될 포트
+            fi
+          
+            echo "현재 활성 컨테이너: $CURRENT_CONTAINER_NAME (호스트 포트: $CURRENT_HOST_PORT)"
+            echo "다음 배포될 컨테이너: $NEXT_CONTAINER_NAME (호스트 포트: $NEXT_HOST_PORT)"
+          
+            # 1. 최신 Docker 이미지 풀
+            echo "최신 이미지($IMAGE) 풀링..."
+            docker pull "$IMAGE"
+          
+            # 2. 다음 컨테이너 중지 및 제거 (만약 이전에 실행 중이던 잔여 컨테이너가 있다면)
+            echo "다음 컨테이너($NEXT_CONTAINER_NAME) 중지 및 제거 (만약 존재한다면)..."
+            docker stop "$NEXT_CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$NEXT_CONTAINER_NAME" 2>/dev/null || true
+          
+            # 3. 다음 컨테이너 실행
+            echo "새 컨테이너($NEXT_CONTAINER_NAME) 실행 중..."
+            docker run -d \
+              --network "$DOCKER_NETWORK_NAME" \
+              --name "$NEXT_CONTAINER_NAME" \
+              -p "$NEXT_HOST_PORT":8080 \ # 호스트 포트 -> 컨테이너 내부 8080 포트 매핑
+              -e TZ=Asia/Seoul \
+              "$IMAGE"
+          
+            # 4. 새 컨테이너 헬스 체크 대기
+            echo "새 컨테이너($NEXT_CONTAINER_NAME) 헬스 체크 대기 중..."
+            START_TIME=$(date +%s)
+            while true; do
+              # 호스트의 매핑된 포트를 통해 헬스 체크 수행
+              HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$NEXT_HOST_PORT$HEALTH_ENDPOINT)
+              # 실제 Spring Boot 애플리케이션의 health endpoint 응답 확인
+              CONTENT=$(curl -s http://localhost:$NEXT_HOST_PORT$HEALTH_ENDPOINT)
+          
+              if [[ "$HEALTH_STATUS" == "200" && "$CONTENT" == *'"status":"UP"'* ]]; then
+                echo "✅ $NEXT_CONTAINER_NAME 컨테이너가 UP 상태입니다!"
+                break
+              fi
+          
+              ELAPSED_TIME=$(( $(date +%s) - START_TIME ))
+              if [[ $ELAPSED_TIME -ge $TIMEOUT ]]; then
+                echo "❌ 타임아웃: $NEXT_CONTAINER_NAME 컨테이너가 $TIMEOUT 초 안에 시작되지 않았습니다."
+                docker stop "$NEXT_CONTAINER_NAME" || true
+                docker rm "$NEXT_CONTAINER_NAME" || true
+                exit 1 # 스크립트 실패로 종료
+              fi
+          
+              echo "⏳ $NEXT_CONTAINER_NAME UP 대기 중... ($ELAPSED_TIME/${TIMEOUT}초)"
+              sleep 5 # 5초 간격으로 다시 확인
+            done
+          
+            # HAProxy의 DNS 캐시 업데이트 시간을 고려하여 잠시 대기
+            echo "HAProxy DNS 캐시 업데이트를 위해 10초 대기 중..."
+            sleep 10
+          
+            # 5. 기존 컨테이너 중지 및 제거
+            echo "기존 컨테이너($CURRENT_CONTAINER_NAME) 중지 및 제거 중..."
+            docker stop "$CURRENT_CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CURRENT_CONTAINER_NAME" 2>/dev/null || true
+          
+            # 6. 불필요한 이미지(dangling images) 제거
+            echo "불필요한 dangling 이미지 제거 중..."
+            docker rmi $(docker images -f "dangling=true" -q) 2>/dev/null || true
+          
+            echo "✅ 배포 완료! 현재 활성 컨테이너: $NEXT_CONTAINER_NAME (호스트 포트: $NEXT_HOST_PORT)"
+          EOF
+          )
+          # 모든 인스턴스 ID에 대해 SSM Send-Command 실행
+          echo "모든 인스턴스($INSTANCE_IDS)에 배포 명령 전송 중..."
+          aws ssm send-command \
+          --instance-ids "${{ env.INSTANCE_IDS }}" \
+          --document-name "AWS-RunShellScript" \
+          --parameters "commands=$DEPLOY_SCRIPT,parameters=[\"$IMAGE_FULL_PATH\",\"${{ env.HEALTH_ENDPOINT }}\",\"${{ env.TIMEOUT }}\",\"${{ env.DOCKER_NETWORK_NAME }}\"]" \
+          --comment "Deploy app via GitHub Actions Blue/Green" \
+          --region ${{ env.AWS_REGION }} \
+          --output text
+          
+          echo "모든 인스턴스에 명령 전송 완료. SSM 콘솔에서 실행 상태를 확인하세요."
