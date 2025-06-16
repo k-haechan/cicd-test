@@ -4,7 +4,8 @@ on:
   pull_request:
     branches: [main]
     types: [closed] # PR이 머지될 때만 작동
-
+permissions:
+  contents: write 
 jobs:
   bump-version-and-release:
     if: github.event.pull_request.merged == true
